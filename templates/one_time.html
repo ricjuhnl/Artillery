@@ -10,6 +10,11 @@
                 <p class="text-muted small mb-3">
                     Enter a single URL to download immediately using the global gallery-dl config and
                     the default downloads destination.
+                    <br>
+                    Gallery/site URLs use gallery-dl. Raw <code>.m3u8</code>/<code>.mpd</code> stream URLs
+                    and supported video pages (hotleak.vip) are resolved and downloaded with yt-dlp
+                    instead — those streams are signed and only valid for a short time, so fire the
+                    download shortly after copying the URL.
                 </p>
 
                 <form method="post" action="{{ url_for('one_time_download') }}">

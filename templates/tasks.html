@@ -640,7 +640,7 @@ a.r-item:hover {
             <div class="mb-4">
               <label class="form-label" for="cCmd">Command</label>
               <textarea id="cCmd" class="form-control form-control-sm" rows="2" name="command_display"></textarea>
-              <div class="form-text">Backend adds <code>--config</code> and <code>--destination</code> if missing. Tick <strong>OAuth cache</strong> for sites that need it, then authenticate from the <a href="{{ url_for('oauth_page') }}">OAuth</a> page after saving.</div>
+              <div class="form-text">Backend adds <code>--config</code> and <code>--destination</code> if missing. Tick <strong>OAuth cache</strong> for sites that need it, then authenticate from the <a href="{{ url_for('oauth_page') }}">OAuth</a> page after saving. <strong>.m3u8/.mpd stream URLs and supported video pages (hotleak.vip)</strong> automatically switch the command to yt-dlp — gallery-dl can't open raw stream URLs, and signed stream URLs are re-resolved on every run.</div>
             </div>
             <input type="hidden" id="cCmdH" name="command"/>
             <button type="submit" class="btn btn-sm btn-go">Create task</button>
@@ -848,7 +848,7 @@ a.r-item:hover {
                 <div class="mb-4">
                   <label class="form-label" for="eCmd">Command</label>
                   <textarea id="eCmd" class="form-control form-control-sm" rows="2" name="command_display"></textarea>
-                  <div class="form-text">Backend adds <code>--config</code> and <code>--destination</code> if missing. Tick <strong>OAuth cache</strong> for sites that need it, then authenticate from the <a href="{{ url_for('oauth_page') }}">OAuth</a> page after saving.</div>
+                  <div class="form-text">Backend adds <code>--config</code> and <code>--destination</code> if missing. Tick <strong>OAuth cache</strong> for sites that need it, then authenticate from the <a href="{{ url_for('oauth_page') }}">OAuth</a> page after saving. <strong>.m3u8/.mpd stream URLs and supported video pages (hotleak.vip)</strong> automatically switch the command to yt-dlp — gallery-dl can't open raw stream URLs, and signed stream URLs are re-resolved on every run.</div>
                 </div>
                 <input type="hidden" id="eCmdH" name="command"/>
                 <button type="submit" class="btn btn-sm btn-go">Save changes</button>

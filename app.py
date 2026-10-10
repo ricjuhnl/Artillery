@@ -5,8 +5,11 @@ import zipfile
 import mimetypes
 import datetime as dt
 import re
+import base64
+import html
 import urllib.request
 import urllib.error
+from urllib.parse import urlparse
 import http.client
 import subprocess
 import shlex
@@ -384,6 +387,27 @@ ONE_TIME_STOP_FILE = os.path.join(CONFIG_ROOT, "one_time_download.stop")
 ONE_TIME_LOG_TAIL_LINES = int(os.environ.get("ONE_TIME_LOG_TAIL_LINES", "50"))
 ONE_TIME_RECENT_DOWNLOADS = int(os.environ.get("ONE_TIME_RECENT_DOWNLOADS", "16"))
 
+# ---------------------------------------------------------------------
+# Stream (HLS .m3u8 / DASH .mpd) download support
+#
+# gallery-dl has no extractor for raw stream URLs ("Unsupported URL"), and
+# some sites (hotleak.vip) only expose a signed, time-limited m3u8 after
+# client-side decoding. Such URLs are routed to yt-dlp with browser-like
+# headers — see _resolve_for_download() and _stream_command_parts().
+# ---------------------------------------------------------------------
+STREAM_BROWSER_UA = os.environ.get(
+    "ARTILLERY_STREAM_UA",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+)
+# Seconds to pause between HTTP requests during a stream download. A small
+# delay keeps rate-limited CDNs from answering 403/429 mid-download; set to
+# 0 for maximum throughput on tolerant networks.
+STREAM_SLEEP_REQUESTS = float(os.environ.get("ARTILLERY_STREAM_SLEEP", "1") or "0")
+# Extra yt-dlp arguments appended to stream downloads (shlex parsed), e.g.
+# "-4 --concurrent-fragment-downloads 1".
+STREAM_EXTRA_ARGS = shlex.split(os.environ.get("ARTILLERY_STREAM_EXTRA_ARGS", ""))
+
 # Media wall notify file for SSE
 MEDIAWALL_NOTIFY_FILE = os.path.join(os.environ.get('CONFIG_DIR', '/config'), 'mediawall.notify')
 
@@ -498,6 +522,140 @@ def _get_tool_version(cmd: str) -> str:
         except Exception:
             _tool_version_cache[cmd] = "not found"
     return _tool_version_cache[cmd]
+
+
+# ---------------------------------------------------------------------
+# Stream URL resolution (m3u8 / mpd)
+# ---------------------------------------------------------------------
+
+_STREAM_PATH_RE = re.compile(r"\.(?:m3u8|mpd)(?:[?#]|$)", re.IGNORECASE)
+
+
+def _looks_like_stream_url(url: str) -> bool:
+    """True for raw HLS (.m3u8) or DASH (.mpd) media URLs."""
+    try:
+        path = urlparse(url).path
+    except Exception:
+        return False
+    return bool(_STREAM_PATH_RE.search(path))
+
+
+def _url_origin(url: str) -> Optional[str]:
+    try:
+        u = urlparse(url)
+        if u.scheme and u.hostname:
+            return f"{u.scheme}://{u.hostname}"
+    except Exception:
+        pass
+    return None
+
+
+def _is_hotleak_video_page(url: str) -> bool:
+    """hotleak.vip video page (/<model>/video/<id>). The page embeds the
+    signed m3u8 URL obfuscated in a data-video attribute, decoded by
+    client-side JS — so the raw page URL is not directly downloadable."""
+    try:
+        u = urlparse(url)
+    except Exception:
+        return False
+    if u.scheme not in ("http", "https"):
+        return False
+    host = (u.hostname or "").lower()
+    if host != "hotleak.vip" and not host.endswith(".hotleak.vip"):
+        return False
+    return re.match(r"^/[^/]+/video/\d+/?$", u.path) is not None
+
+
+def _fetch_url_text(url: str, timeout: int = 30) -> str:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": STREAM_BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": (_url_origin(url) or "") + "/",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def _decode_hotleak_src(src: str) -> str:
+    """Reverse of the site's inline obfuscation:
+    base64decode(src[16:-16][::-1])."""
+    core = src[16:-16] if len(src) > 32 else src
+    return base64.b64decode(core[::-1]).decode("utf-8", "replace")
+
+
+def _resolve_hotleak_video_page(url: str) -> Optional[str]:
+    """Fetch a hotleak.vip video page and return the fresh signed .m3u8 URL
+    embedded in it (None if the page had no decodable stream source)."""
+    try:
+        page = _fetch_url_text(url)
+    except Exception as exc:
+        app.logger.warning("Stream resolve: page fetch failed for %s: %s", url, exc)
+        return None
+    m = re.search(r'data-video="([^"]+)"', page)
+    if not m:
+        app.logger.warning("Stream resolve: no data-video attribute in %s", url)
+        return None
+    try:
+        data = json.loads(html.unescape(m.group(1)))
+        src = data["source"][0]["src"]
+        decoded = _decode_hotleak_src(src)
+    except Exception as exc:
+        app.logger.warning("Stream resolve: could not decode stream source from %s: %s", url, exc)
+        return None
+    if not _looks_like_stream_url(decoded):
+        app.logger.warning("Stream resolve: decoded source does not look like a stream URL: %s", decoded[:160])
+        return None
+    return decoded
+
+
+def _resolve_for_download(url: str) -> str:
+    """Return a directly downloadable URL for `url`.
+
+    Raw .m3u8/.mpd URLs are already directly downloadable and pass through
+    unchanged. Video pages from known sites (hotleak.vip) embed a
+    time-limited signed stream URL (the signature expires within minutes),
+    so a fresh one is resolved on every download. Everything else is
+    returned as-is.
+    """
+    u = (url or "").strip()
+    if not u:
+        return u
+    if _is_hotleak_video_page(u):
+        resolved = _resolve_hotleak_video_page(u)
+        if resolved:
+            return resolved
+    return u
+
+
+def _stream_command_parts(dest: str, referer: Optional[str] = None,
+                          cookies_file: Optional[str] = None,
+                          input_file: Optional[str] = None) -> list:
+    """yt-dlp command line for a resolved stream URL (or a file of them).
+
+    Browser-like headers are deliberate: the CDNs behind these sites
+    reject yt-dlp's default user-agent and bursty request patterns with
+    403, so we send a real UA + referer and pace the requests a little.
+    """
+    parts = ["yt-dlp", "--no-playlist", "--user-agent", STREAM_BROWSER_UA]
+    if referer:
+        parts += ["--referer", referer]
+    if cookies_file and os.path.exists(cookies_file):
+        parts += ["--cookies", cookies_file]
+    if STREAM_SLEEP_REQUESTS > 0:
+        parts += ["--sleep-requests", str(STREAM_SLEEP_REQUESTS)]
+    if STREAM_EXTRA_ARGS:
+        parts += list(STREAM_EXTRA_ARGS)
+    parts += [
+        "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "-o", os.path.join(dest, "%(title,uploader,id)s.%(ext)s"),
+    ]
+    if input_file:
+        # yt-dlp's flag for a URL list file (gallery-dl calls it --input-file);
+        # yt-dlp skips lines starting with # / ; / ] automatically.
+        parts += ["--batch-file", input_file]
+    return parts
 
 
 
@@ -1347,6 +1505,44 @@ def tasks():
         if not command:
             command = "gallery-dl --input-file urls.txt"
 
+        # Stream URLs (.m3u8/.mpd) and supported video pages (hotleak.vip)
+        # cannot be downloaded with gallery-dl — auto-generate a yt-dlp
+        # command instead. Signed stream URLs are re-resolved at run time
+        # (see run_task_background), so a scheduled task keeps working.
+        effective_urls_text = urls_text if not keep_existing_urls else ""
+        if keep_existing_urls and os.path.isdir(task_folder):
+            existing_urls = os.path.join(task_folder, "urls.txt")
+            if os.path.exists(existing_urls):
+                effective_urls_text = read_text(existing_urls) or ""
+        url_lines = [l.strip() for l in effective_urls_text.splitlines()
+                     if l.strip() and not l.strip().startswith("#")]
+        stream_lines = [u for u in url_lines
+                        if _looks_like_stream_url(u) or _is_hotleak_video_page(u)]
+
+        if stream_lines:
+            try:
+                first = os.path.basename(shlex.split(command)[0]) if command else ""
+            except ValueError:
+                first = ""
+            if first == "gallery-dl" and shutil.which("yt-dlp") is not None:
+                referer = _url_origin(stream_lines[0])
+                if referer:
+                    referer += "/"
+                command = " ".join(shlex.quote(p) for p in _stream_command_parts(
+                    DOWNLOADS_ROOT, referer=referer, input_file="urls.txt"))
+                flash(
+                    "Stream URL (.m3u8/.mpd) or video page detected — command switched "
+                    "from gallery-dl to yt-dlp (gallery-dl cannot open raw stream URLs). "
+                    "Signed stream URLs are re-resolved on every run.",
+                    "warning" if len(stream_lines) < len(url_lines) else "success",
+                )
+            elif first != "yt-dlp":
+                flash(
+                    "Warning: gallery-dl does not support stream URLs (.m3u8/.mpd) — "
+                    "the command needs to use yt-dlp for those.",
+                    "warning",
+                )
+
         try:
             parts = shlex.split(command)
             if parts and parts[0] == "gallery-dl":
@@ -1902,8 +2098,15 @@ def one_time_download():
         if not entered_url:
             flash("Please enter a URL.", "error")
             return redirect(url_for("one_time_download"))
-        if shutil.which("gallery-dl") is None:
+        if shutil.which("gallery-dl") is None and not (
+            _looks_like_stream_url(entered_url) or _is_hotleak_video_page(entered_url)
+        ):
             flash("gallery-dl is not available on the PATH.", "error")
+            return redirect(url_for("one_time_download"))
+        if (_looks_like_stream_url(entered_url) or _is_hotleak_video_page(entered_url)) \
+                and shutil.which("yt-dlp") is None:
+            flash("yt-dlp is not available on the PATH — it is required for "
+                  ".m3u8/.mpd stream URLs and supported video pages.", "error")
             return redirect(url_for("one_time_download"))
 
         try:
@@ -2024,20 +2227,46 @@ def run_one_time_download(url: str):
     env["GALLERY_DL_CONFIG"] = CONFIG_FILE
     env["PATH"] = env.get("PATH", "") + os.pathsep + "/usr/local/bin"
 
-    cmd_parts = [
-        "gallery-dl",
-        "--config",
-        CONFIG_FILE,
-        "--destination",
-        DOWNLOADS_ROOT,
-        url,
-    ]
+    # gallery-dl has no extractor for raw .m3u8/.mpd URLs ("Unsupported URL"),
+    # and video pages from some sites only expose a signed, time-limited
+    # stream URL after client-side decoding. Resolve such URLs and hand the
+    # stream to yt-dlp with browser-like headers instead.
+    stream_page = _is_hotleak_video_page(url)
+    resolved_url = _resolve_for_download(url)
+    using_stream = _looks_like_stream_url(resolved_url)
+
+    if stream_page and not using_stream:
+        app.logger.warning("One-time download: could not resolve a stream URL from %s", url)
+        with open(ONE_TIME_LOG_FILE, "a", encoding="utf-8") as logf:
+            logf.write(
+                f"\nERROR: could not resolve a stream URL from page {url} "
+                "(network error, or the page layout changed).\n"
+            )
+        return
+
+    if using_stream:
+        referer = _url_origin(url) or _url_origin(resolved_url)
+        if referer:
+            referer += "/"
+        cmd_parts = _stream_command_parts(DOWNLOADS_ROOT, referer=referer) + [resolved_url]
+    else:
+        cmd_parts = [
+            "gallery-dl",
+            "--config",
+            CONFIG_FILE,
+            "--destination",
+            DOWNLOADS_ROOT,
+            url,
+        ]
 
     now = dt.datetime.now().isoformat()
     try:
         with open(ONE_TIME_LOG_FILE, "a", encoding="utf-8") as logf:
             logf.write(f"\n\n==== One-time download started at {now} ====\n")
             logf.write(f"URL: {url}\n")
+            if using_stream:
+                logf.write(f"Stream URL (resolved, time-limited): {resolved_url}\n")
+                logf.write("Using yt-dlp — gallery-dl does not support stream URLs.\n")
             logf.write(f"Command: {' '.join(shlex.quote(p) for p in cmd_parts)}\n\n")
             logf.flush()
 
@@ -2139,6 +2368,49 @@ def run_task_background(task_folder: str):
 
     cmd_parts = _resolve_task_cache_file(cmd_parts, task_folder)
 
+    # Stream tasks: urls.txt may contain video pages (e.g. hotleak.vip) whose
+    # signed m3u8 URLs expire within minutes — resolve a fresh stream URL for
+    # each on every run rather than relying on the file's contents staying
+    # valid. Raw .m3u8/.mpd lines pass through untouched.
+    resolved_urls_file = None
+    n_stream_resolved = 0
+    n_stream_failed = 0
+    if cmd_parts and os.path.basename(cmd_parts[0]) == "yt-dlp":
+        for i, p in enumerate(cmd_parts):
+            target = None
+            # yt-dlp uses --batch-file; --input-file is matched too, in case
+            # an older task still carries the gallery-dl-style flag.
+            if p in ("--batch-file", "--input-file") and i + 1 < len(cmd_parts) and cmd_parts[i + 1] == "urls.txt":
+                target = i + 1
+            elif p.startswith(("--batch-file=", "--input-file=")) and p.split("=", 1)[1] == "urls.txt":
+                target = i
+            if target is None:
+                continue
+            lines = [l.strip() for l in (read_text(urls_file) or "").splitlines()
+                     if l.strip() and not l.strip().startswith("#")]
+            resolved, changed = [], False
+            for line in lines:
+                r = _resolve_for_download(line)
+                if r != line:
+                    changed = True
+                    n_stream_resolved += 1
+                    time.sleep(1.0)  # be gentle with the CDN's rate limiter
+                elif _is_hotleak_video_page(line):
+                    n_stream_failed += 1
+                    app.logger.warning("Task: could not resolve stream URL from %s", line)
+                resolved.append(r if r else line)
+            if changed:
+                resolved_urls_file = os.path.join(task_folder, ".resolved_urls.txt")
+                write_text(resolved_urls_file, "\n".join(resolved) + "\n")
+                cmd_parts[target] = ".resolved_urls.txt"
+            break
+        # A video page passed as a positional argument instead of via input file
+        if len(cmd_parts) > 1 and _is_hotleak_video_page(cmd_parts[-1]):
+            r = _resolve_hotleak_video_page(cmd_parts[-1])
+            if r:
+                cmd_parts[-1] = r
+                n_stream_resolved += 1
+
     env = os.environ.copy()
     env["GALLERY_DL_CONFIG"] = CONFIG_FILE
     env["PATH"] = env.get("PATH", "") + os.pathsep + "/usr/local/bin"
@@ -2148,6 +2420,12 @@ def run_task_background(task_folder: str):
             config_exists = os.path.exists(CONFIG_FILE)
             logf.write(f"\n\n==== Run at {now} ====\n")
             logf.write(f"Artillery: using config {CONFIG_FILE} (exists={config_exists})\n")
+            if n_stream_resolved:
+                logf.write(f"Artillery: resolved {n_stream_resolved} time-limited stream URL(s) "
+                           "into .resolved_urls.txt\n")
+            if n_stream_failed:
+                logf.write(f"Artillery: WARNING: could not resolve {n_stream_failed} video page "
+                           "URL(s); left as-is, those downloads will likely fail.\n")
             logf.write(f"$ {' '.join(cmd_parts)}\n\n")
             logf.flush()
 
@@ -2216,7 +2494,7 @@ def run_task_background(task_folder: str):
         _record_run(task_folder, success=False, duration=0, stopped=False)
     finally:
         _release_task_slot()
-        for p in (lock_path, pid_path):
+        for p in (lock_path, pid_path) + ((resolved_urls_file,) if resolved_urls_file else ()):
             try:
                 if os.path.exists(p):
                     os.remove(p)
