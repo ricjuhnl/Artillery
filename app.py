@@ -407,6 +407,17 @@ STREAM_SLEEP_REQUESTS = float(os.environ.get("ARTILLERY_STREAM_SLEEP", "1") or "
 # Extra yt-dlp arguments appended to stream downloads (shlex parsed), e.g.
 # "-4 --concurrent-fragment-downloads 1".
 STREAM_EXTRA_ARGS = shlex.split(os.environ.get("ARTILLERY_STREAM_EXTRA_ARGS", ""))
+# gallery-dl downloads hotleak.vip videos by running yt-dlp as an embedded
+# Python module (its "ytdl" downloader) — yt-dlp CLI flags such as
+# --sleep-requests never reach that instance, and its per-video retry loop
+# has no backoff. Artillery therefore manages a small extra config file,
+# appended to gallery-dl commands with -c *after* the user's
+# gallery-dl.conf, that paces gallery-dl's own hotleak requests and the
+# embedded yt-dlp's video downloads. See _stream_pacing_config().
+STREAM_PACING_CONFIG_FILE = os.path.join(CONFIG_ROOT, "gallery-dl.artillery.conf")
+# Seconds to pause before each hotleak video download (the embedded yt-dlp
+# randomizes between this and 3x). 0 = no per-video pause.
+STREAM_VIDEO_SLEEP = float(os.environ.get("ARTILLERY_STREAM_VIDEO_SLEEP", "5") or "0")
 
 # Media wall notify file for SSE
 MEDIAWALL_NOTIFY_FILE = os.path.join(os.environ.get('CONFIG_DIR', '/config'), 'mediawall.notify')
@@ -566,15 +577,68 @@ def _is_hotleak_video_page(url: str) -> bool:
     return re.match(r"^/[^/]+/video/\d+/?$", u.path) is not None
 
 
-def _fetch_url_text(url: str, timeout: int = 30) -> str:
-    req = urllib.request.Request(url, headers={
-        "User-Agent": STREAM_BROWSER_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": (_url_origin(url) or "") + "/",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", "replace")
+# Per-host throttle for Artillery's own HTTP requests (page fetches used to
+# resolve signed stream URLs). The CDN rate-limits per IP, so resolution
+# traffic is paced the same way as downloads and never bursts.
+_HOST_THROTTLE: dict = {}
+_HOST_THROTTLE_LOCK = threading.Lock()
+
+
+def _throttle_host(url: str, min_interval: Optional[float] = None) -> None:
+    """Wait until at least `min_interval` seconds (default: ARTILLERY_STREAM_SLEEP)
+    have passed since the last request to the same origin."""
+    interval = STREAM_SLEEP_REQUESTS if min_interval is None else min_interval
+    if not interval or interval <= 0:
+        return
+    origin = (_url_origin(url) or url).lower()
+    with _HOST_THROTTLE_LOCK:
+        wait = _HOST_THROTTLE.get(origin, 0.0) + interval - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _HOST_THROTTLE[origin] = time.monotonic()
+
+
+def _retry_after_delay(exc: urllib.error.HTTPError) -> Optional[float]:
+    """Seconds to wait before retrying, from Retry-After / X-RateLimit-Reset."""
+    try:
+        raw = exc.headers.get("Retry-After") or exc.headers.get("X-RateLimit-Reset")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    # X-RateLimit-Reset may be an epoch timestamp rather than a delta.
+    if value > time.time():
+        value = value - time.time()
+    return max(5.0, min(value, 600.0))
+
+
+def _fetch_url_text(url: str, timeout: int = 30, retries: int = 3) -> str:
+    """Fetch a page with browser-like headers. Requests are paced per host,
+    and 429/5xx responses are retried with backoff (honoring Retry-After /
+    X-RateLimit-Reset) instead of failing immediately."""
+    for attempt in range(1, retries + 1):
+        _throttle_host(url)
+        req = urllib.request.Request(url, headers={
+            "User-Agent": STREAM_BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": (_url_origin(url) or "") + "/",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (408, 429, 500, 502, 503, 504) or attempt >= retries:
+                raise
+            delay = _retry_after_delay(exc) or min(30.0 * (2 ** (attempt - 1)), 120.0)
+            app.logger.warning("Stream resolve: HTTP %s for %s — retrying in %.0fs (%d/%d)",
+                               exc.code, url, delay, attempt, retries)
+            time.sleep(delay)
+    raise RuntimeError("unreachable")
 
 
 def _decode_hotleak_src(src: str) -> str:
@@ -656,6 +720,133 @@ def _stream_command_parts(dest: str, referer: Optional[str] = None,
         # yt-dlp skips lines starting with # / ; / ] automatically.
         parts += ["--batch-file", input_file]
     return parts
+
+
+# ---------------------------------------------------------------------
+# gallery-dl pacing for hotleak video downloads (embedded yt-dlp)
+# ---------------------------------------------------------------------
+
+def _stream_pacing_config() -> dict:
+    """gallery-dl config that paces hotleak.vip downloads.
+
+    Loaded via -c *after* the user's gallery-dl.conf, so these hotleak-scoped
+    keys layer on top of the user's settings. Two layers:
+
+    * ``extractor.hotleak.*`` — gallery-dl's own requests (creator-page JSON,
+      video pages): minimum spacing between requests, retry waits, and
+      exponential 429 backoff (60s, 120s, 240s, ...).
+    * ``extractor.hotleak.ytdl.raw-options`` — raw yt-dlp params for the
+      yt-dlp instance embedded in gallery-dl's "ytdl" downloader (CLI flags
+      never reach it): pause before each manifest fetch, randomized pause
+      before each video download, native HLS with fragment retries, and
+      browser-like headers for playlist *and* segment requests.
+    """
+    return {
+        "extractor": {
+            "hotleak": {
+                "sleep-request": 1.5,
+                "sleep-retries": "15-45",
+                "sleep-429": "exponential=60",
+                "retries": 8,
+                "ytdl": {
+                    "raw-options": {
+                        "sleep_interval_requests": STREAM_SLEEP_REQUESTS,
+                        "sleep_interval": STREAM_VIDEO_SLEEP,
+                        "max_sleep_interval": STREAM_VIDEO_SLEEP * 3,
+                        "hls_prefer_native": True,
+                        "concurrent_fragment_downloads": 1,
+                        "fragment_retries": 20,
+                        "retries": 10,
+                        "http_headers": {
+                            "User-Agent": STREAM_BROWSER_UA,
+                            "Referer": "https://hotleak.vip/",
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+
+def _ensure_stream_pacing_config() -> None:
+    """(Re)write the Artillery-managed pacing config if it changed."""
+    try:
+        content = json.dumps(_stream_pacing_config(), indent=2, sort_keys=True) + "\n"
+        try:
+            with open(STREAM_PACING_CONFIG_FILE, "r", encoding="utf-8") as fp:
+                if fp.read() == content:
+                    return
+        except (FileNotFoundError, OSError):
+            pass
+        write_text(STREAM_PACING_CONFIG_FILE, content)
+    except Exception:
+        app.logger.warning("Could not write stream pacing config",
+                           exc_info=True)
+
+
+def _append_stream_pacing_config(cmd_parts: list) -> list:
+    """Add '-c <pacing conf>' to a gallery-dl command so its embedded yt-dlp
+    (used for hotleak videos) runs paced. Idempotent."""
+    if not cmd_parts or os.path.basename(cmd_parts[0]) != "gallery-dl":
+        return cmd_parts
+    if STREAM_PACING_CONFIG_FILE in cmd_parts:
+        return cmd_parts
+    # Insert after the base config flags when present; -c files are loaded
+    # after --config regardless of position, so ordering is safe either way.
+    insert_at = 1
+    for i, part in enumerate(cmd_parts):
+        if part in ("--config", "-c") and i + 1 < len(cmd_parts):
+            insert_at = i + 2
+    cmd_parts[insert_at:insert_at] = ["-c", STREAM_PACING_CONFIG_FILE]
+    return cmd_parts
+
+
+# ---------------------------------------------------------------------
+# Per-origin run serialization
+#
+# hotleak.vip's CDN rate-limits per IP: two tasks downloading from the same
+# site at once double the request rate and trip the limiter even with
+# per-request pacing. Runs whose URLs share a rate-limited origin are
+# therefore serialized (independent sites still run in parallel).
+# ---------------------------------------------------------------------
+_ORIGIN_LOCKS: dict = {}
+_ORIGIN_LOCKS_GUARD = threading.Lock()
+
+
+def _is_rate_limited_origin(origin: str) -> bool:
+    return origin == "https://hotleak.vip" or origin.endswith(".hotleak.vip")
+
+
+def _url_origins(urls_text: Optional[str]) -> List[str]:
+    origins = set()
+    for line in (urls_text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or not line.lower().startswith("http"):
+            continue
+        origin = _url_origin(line)
+        if origin:
+            origins.add(origin.lower())
+    return sorted(origins)
+
+
+def _acquire_origin_locks(origins: List[str]) -> List[threading.Lock]:
+    """Acquire the run locks for rate-limited origins (sorted order prevents
+    deadlocks between tasks with overlapping URL lists)."""
+    held = []
+    for origin in sorted(o for o in (origins or []) if _is_rate_limited_origin(o)):
+        with _ORIGIN_LOCKS_GUARD:
+            lock = _ORIGIN_LOCKS.setdefault(origin, threading.Lock())
+        lock.acquire()
+        held.append(lock)
+    return held
+
+
+def _release_origin_locks(held: List[threading.Lock]) -> None:
+    for lock in reversed(held):
+        try:
+            lock.release()
+        except Exception:
+            app.logger.debug("Could not release origin lock", exc_info=True)
 
 
 
@@ -2258,6 +2449,13 @@ def run_one_time_download(url: str):
             DOWNLOADS_ROOT,
             url,
         ]
+        # Pacing config for hotleak video downloads (gallery-dl's embedded
+        # yt-dlp does not see CLI flags) + serialize with other runs on the
+        # same rate-limited site.
+        _ensure_stream_pacing_config()
+        _append_stream_pacing_config(cmd_parts)
+
+    origin_locks = _acquire_origin_locks(_url_origins(url))
 
     now = dt.datetime.now().isoformat()
     try:
@@ -2303,6 +2501,7 @@ def run_one_time_download(url: str):
         with open(ONE_TIME_LOG_FILE, "a", encoding="utf-8") as logf:
             logf.write(f"\nERROR while running one-time download: {exc}\n")
     finally:
+        _release_origin_locks(origin_locks)
         try:
             if os.path.exists(ONE_TIME_PID_FILE):
                 os.remove(ONE_TIME_PID_FILE)
@@ -2368,6 +2567,13 @@ def run_task_background(task_folder: str):
 
     cmd_parts = _resolve_task_cache_file(cmd_parts, task_folder)
 
+    # gallery-dl runs yt-dlp as an embedded module for hotleak videos —
+    # CLI flags never reach it, so pace it via the Artillery-managed extra
+    # config file (see _stream_pacing_config).
+    if cmd_parts and os.path.basename(cmd_parts[0]) == "gallery-dl":
+        _ensure_stream_pacing_config()
+        _append_stream_pacing_config(cmd_parts)
+
     # Stream tasks: urls.txt may contain video pages (e.g. hotleak.vip) whose
     # signed m3u8 URLs expire within minutes — resolve a fresh stream URL for
     # each on every run rather than relying on the file's contents staying
@@ -2375,6 +2581,7 @@ def run_task_background(task_folder: str):
     resolved_urls_file = None
     n_stream_resolved = 0
     n_stream_failed = 0
+    skip_run = False
     if cmd_parts and os.path.basename(cmd_parts[0]) == "yt-dlp":
         for i, p in enumerate(cmd_parts):
             target = None
@@ -2394,15 +2601,26 @@ def run_task_background(task_folder: str):
                 if r != line:
                     changed = True
                     n_stream_resolved += 1
-                    time.sleep(1.0)  # be gentle with the CDN's rate limiter
+                    resolved.append(r)
+                    time.sleep(STREAM_SLEEP_REQUESTS or 1.0)  # be gentle with the CDN's rate limiter
                 elif _is_hotleak_video_page(line):
+                    # Drop the unresolvable page URL instead of handing it to
+                    # yt-dlp — its generic extractor would refetch the page
+                    # several times and burn through the CDN's rate limit.
                     n_stream_failed += 1
-                    app.logger.warning("Task: could not resolve stream URL from %s", line)
-                resolved.append(r if r else line)
-            if changed:
-                resolved_urls_file = os.path.join(task_folder, ".resolved_urls.txt")
-                write_text(resolved_urls_file, "\n".join(resolved) + "\n")
-                cmd_parts[target] = ".resolved_urls.txt"
+                    app.logger.warning("Task: could not resolve stream URL from %s — skipping", line)
+                else:
+                    resolved.append(line)
+            if changed or n_stream_failed:
+                if not resolved:
+                    # Every URL failed to resolve — running yt-dlp with an
+                    # empty list (or the stale page URLs) is pointless and
+                    # just burns through the CDN's rate limit.
+                    skip_run = True
+                else:
+                    resolved_urls_file = os.path.join(task_folder, ".resolved_urls.txt")
+                    write_text(resolved_urls_file, "\n".join(resolved) + "\n")
+                    cmd_parts[target] = ".resolved_urls.txt"
             break
         # A video page passed as a positional argument instead of via input file
         if len(cmd_parts) > 1 and _is_hotleak_video_page(cmd_parts[-1]):
@@ -2410,10 +2628,30 @@ def run_task_background(task_folder: str):
             if r:
                 cmd_parts[-1] = r
                 n_stream_resolved += 1
+            else:
+                # Nothing left to download — skip the run instead of letting
+                # yt-dlp's generic extractor hammer the page.
+                cmd_parts.pop()
+                n_stream_failed += 1
+                skip_run = True
+
+    if skip_run:
+        with open(logs_path, "a", encoding="utf-8") as logf:
+            logf.write(f"\n\n==== Run at {now} ====\n")
+            logf.write("Artillery: skipped — no downloadable URLs (video pages could not be "
+                       "resolved, likely rate-limited). Will retry next run.\n")
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+        _release_task_slot()
+        return
 
     env = os.environ.copy()
     env["GALLERY_DL_CONFIG"] = CONFIG_FILE
     env["PATH"] = env.get("PATH", "") + os.pathsep + "/usr/local/bin"
+
+    # Serialize runs that target the same rate-limited site so concurrent
+    # tasks don't double the request rate (see _acquire_origin_locks).
+    origin_locks = _acquire_origin_locks(_url_origins(read_text(urls_file)))
 
     try:
         with open(logs_path, "a", encoding="utf-8") as logf:
@@ -2425,7 +2663,8 @@ def run_task_background(task_folder: str):
                            "into .resolved_urls.txt\n")
             if n_stream_failed:
                 logf.write(f"Artillery: WARNING: could not resolve {n_stream_failed} video page "
-                           "URL(s); left as-is, those downloads will likely fail.\n")
+                           "URL(s); they were skipped — unresolvable video pages would only "
+                           "burn through the CDN's rate limit.\n")
             logf.write(f"$ {' '.join(cmd_parts)}\n\n")
             logf.flush()
 
@@ -2493,6 +2732,7 @@ def run_task_background(task_folder: str):
             app.logger.warning("Could not write error sentinel after task crash for %s", task_folder, exc_info=True)
         _record_run(task_folder, success=False, duration=0, stopped=False)
     finally:
+        _release_origin_locks(origin_locks)
         _release_task_slot()
         for p in (lock_path, pid_path) + ((resolved_urls_file,) if resolved_urls_file else ()):
             try:
@@ -3303,6 +3543,7 @@ def media_file(subpath):
 # ── Start APScheduler (skip double-start under Werkzeug reloader) ──────────────
 if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
     try:
+        _ensure_stream_pacing_config()
         _load_task_concurrent_max_from_file()
         _load_all_schedules()
         _bg_scheduler.start()
