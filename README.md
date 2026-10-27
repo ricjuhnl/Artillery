@@ -67,6 +67,10 @@ by default; `ARTILLERY_STREAM_VIDEO_SLEEP` sets the minimum, 0 disables it).
 Failed yt-dlp extraction is attempted once per video per run rather than
 immediately retried, so later images can still be processed. Failed videos
 are retried on a later run; this does not remove a server-side rate limit.
+After a Hotleak video returns HTTP 429, Artillery skips all remaining Hotleak
+videos in that run (including other creators in the same URL list), while
+continuing images. Skipped videos are not marked downloaded or archived.
+The video skip resets automatically for each new task or one-time run.
 
 Local regression checks: install `requirements.txt`, then run
 `python -m unittest discover -s tests -v`. These checks do not contact sites

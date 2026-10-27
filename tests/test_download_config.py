@@ -1,5 +1,7 @@
 import ast
 import logging
+import re
+import sys
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -21,10 +23,15 @@ HELPERS = {
     "STREAM_BROWSER_UA": "test-browser",
     "STREAM_PACING_CONFIG_FILE": "/config/gallery-dl.artillery.conf",
     "os": __import__("os"),
+    "sys": sys,
+    "__file__": str(SOURCE),
+    "logging": logging,
+    "re": re,
 }
 for node in TREE.body:
     if isinstance(node, ast.FunctionDef) and node.name in {
         "_stream_pacing_config", "_append_stream_pacing_config",
+        "_run_gallery_dl", "_download_process_args",
     }:
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), "exec"), HELPERS)
 
@@ -63,10 +70,13 @@ class DownloadConfigTests(unittest.TestCase):
     def test_failed_video_does_not_block_next_image(self):
         extr = extractor.find("https://hotleak.vip/example/")
         video = {"creator": "example", "id": 1, "extension": "mp4", "type": "video"}
+        later_video = {**video, "id": 3}
         photo = {"creator": "example", "id": 2, "extension": "jpg", "type": "photo"}
         messages = [
             (Message.Directory, "", video),
             (Message.Url, "ytdl:https://example.invalid/video/1", video),
+            (Message.Directory, "", later_video),
+            (Message.Url, "ytdl:https://example.invalid/video/3", later_video),
             (Message.Directory, "", photo),
             (Message.Url, "https://example.invalid/photo.jpg", photo),
         ]
@@ -88,8 +98,9 @@ class DownloadConfigTests(unittest.TestCase):
             with patch.object(extr, "items", return_value=iter(messages)), \
                     patch.object(extr, "sleep", side_effect=lambda *args: events.append("sleep")), \
                     patch.object(YoutubeDLDownloader, "_extract_url", video_failure), \
-                    patch.object(HttpDownloader, "download", image_download):
-                job.DownloadJob(extr).run()
+                    patch.object(HttpDownloader, "download", image_download), \
+                    patch("gallery_dl.main", side_effect=lambda: job.DownloadJob(extr).run()):
+                HELPERS["_run_gallery_dl"]()
             self.assertEqual(events, ["sleep", "video", "sleep", "image"])
             self.assertEqual(len(list(Path(directory).rglob("*.jpg"))), 1)
 
@@ -112,6 +123,66 @@ class DownloadConfigTests(unittest.TestCase):
         self.assertGreater(command.index(managed), command.index("/config/custom.conf"))
         other = ["yt-dlp", "https://example.invalid/video"]
         self.assertEqual(append(other.copy()), other)
+
+    def test_download_launcher_only_wraps_gallery_dl(self):
+        command = ["gallery-dl", "--input-file", "urls.txt"]
+        launch = HELPERS["_download_process_args"]
+        self.assertEqual(launch(command), [sys.executable, str(SOURCE), "--gallery-dl",
+                                         "--input-file", "urls.txt"])
+        self.assertEqual(command[0], "gallery-dl")
+        other = ["yt-dlp", "https://example.invalid/video"]
+        self.assertEqual(launch(other), other)
+
+
+class VideoRateLimitTests(unittest.TestCase):
+    def run_downloads(self, entries):
+        attempted = []
+
+        def download(job, url, metadata):
+            attempted.append(metadata["id"])
+            if error := metadata.get("error"):
+                logging.getLogger("downloader.ytdl").error(error)
+
+        def main():
+            for site, metadata in entries:
+                # Separate jobs mimic multiple creator URLs in urls.txt.
+                current = SimpleNamespace(extractor=SimpleNamespace(category=site),
+                                          log=logging.getLogger("test"))
+                job.DownloadJob.handle_url(current, "https://example.invalid/media", metadata)
+
+        with patch.object(job.DownloadJob, "handle_url", download), \
+                patch("gallery_dl.main", side_effect=main):
+            HELPERS["_run_gallery_dl"]()
+            self.assertIs(job.DownloadJob.handle_url, download)
+        return attempted
+
+    def test_429_skips_later_videos_across_creators_but_not_images(self):
+        entries = [
+            ("hotleak", {"id": 1, "type": "video", "error": "HTTP Error 429: Too Many Requests"}),
+            ("hotleak", {"id": 2, "extension": "mp4"}),
+            ("hotleak", {"id": 3, "extension": "jpg"}),
+            ("instagram", {"id": 4, "extension": "mp4"}),
+        ]
+        self.assertEqual(self.run_downloads(entries), [1, 3, 4])
+
+    def test_other_errors_do_not_disable_videos(self):
+        entries = [("hotleak", {"id": 1, "type": "video", "error": "HTTP Error 403: Forbidden"}),
+                   ("hotleak", {"id": 2, "type": "video"})]
+        self.assertEqual(self.run_downloads(entries), [1, 2])
+
+    def test_image_429_does_not_disable_videos(self):
+        entries = [("hotleak", {"id": 1, "extension": "jpg", "error": "HTTP Error 429"}),
+                   ("hotleak", {"id": 2, "type": "video"})]
+        self.assertEqual(self.run_downloads(entries), [1, 2])
+
+    def test_other_site_429_does_not_disable_hotleak_videos(self):
+        entries = [("instagram", {"id": 1, "extension": "mp4", "error": "HTTP Error 429"}),
+                   ("hotleak", {"id": 2, "type": "video"})]
+        self.assertEqual(self.run_downloads(entries), [1, 2])
+
+    def test_next_run_tries_videos_again(self):
+        self.run_downloads([("hotleak", {"id": 1, "type": "video", "error": "HTTP Error 429"})])
+        self.assertEqual(self.run_downloads([("hotleak", {"id": 2, "extension": "mp4"})]), [2])
 
 
 if __name__ == "__main__":

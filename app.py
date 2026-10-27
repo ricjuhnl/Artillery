@@ -24,8 +24,70 @@ import random
 import secrets
 import atexit
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Optional, List, Tuple
+
+
+def _run_gallery_dl():
+    """Run gallery-dl with a process-local Hotleak video circuit breaker."""
+    import gallery_dl
+    from gallery_dl.job import DownloadJob
+
+    blocked = False
+    active_video = False
+    original = DownloadJob.handle_url
+
+    class RateLimitHandler(logging.Handler):
+        def emit(self, record):
+            nonlocal blocked
+            if active_video and re.search(
+                r"HTTP(?:\s+Error|\s+status(?:\s+code)?)?[\s:]+429\b"
+                r"|\b429\s*:\s*Too Many Requests",
+                record.getMessage(), re.IGNORECASE,
+            ):
+                blocked = True
+
+    def handle_url(job, url, kwdict):
+        nonlocal active_video
+        is_video = job.extractor.category == "hotleak" and (
+            kwdict.get("type") == "video"
+            or str(kwdict.get("extension", "")).lower() == "mp4"
+            or url.startswith("ytdl:")
+        )
+        if blocked and is_video:
+            job.log.info("Artillery: skipping Hotleak video %s after HTTP 429 "
+                         "(images continue; videos retry next run).", kwdict.get("id", ""))
+            return
+        was_blocked = blocked
+        active_video = is_video
+        try:
+            return original(job, url, kwdict)
+        finally:
+            active_video = False
+            if blocked and not was_blocked:
+                job.log.warning("Artillery: HTTP 429 on a Hotleak video; "
+                                "skipping remaining Hotleak videos for this run.")
+
+    handler = RateLimitHandler(level=logging.ERROR)
+    loggers = [logging.getLogger(name) for name in ("downloader.ytdl", "downloader.http")]
+    for logger in loggers:
+        logger.addHandler(handler)
+    DownloadJob.handle_url = handle_url
+    try:
+        return gallery_dl.main()
+    finally:
+        DownloadJob.handle_url = original
+        for logger in loggers:
+            logger.removeHandler(handler)
+
+
+# This subprocess mode exits before importing Flask or starting schedulers.
+if __name__ == "__main__" and sys.argv[1:2] == ["--gallery-dl"]:
+    sys.argv = ["gallery-dl", *sys.argv[2:]]
+    sys.exit(_run_gallery_dl())
+
+
 from croniter import croniter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -802,6 +864,13 @@ def _append_stream_pacing_config(cmd_parts: list) -> list:
         if part in ("--config", "-c") and i + 1 < len(cmd_parts):
             insert_at = i + 2
     cmd_parts[insert_at:insert_at] = ["-c", STREAM_PACING_CONFIG_FILE]
+    return cmd_parts
+
+
+def _download_process_args(cmd_parts: list) -> list:
+    """Keep command/log syntax intact, but run gallery-dl with the 429 guard."""
+    if cmd_parts and os.path.basename(cmd_parts[0]) == "gallery-dl":
+        return [sys.executable, os.path.abspath(__file__), "--gallery-dl", *cmd_parts[1:]]
     return cmd_parts
 
 
@@ -2473,7 +2542,7 @@ def run_one_time_download(url: str):
             logf.flush()
 
             proc = subprocess.Popen(
-                cmd_parts,
+                _download_process_args(cmd_parts),
                 stdout=logf,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -2673,7 +2742,7 @@ def run_task_background(task_folder: str):
             logf.flush()
 
             proc = subprocess.Popen(
-                cmd_parts,
+                _download_process_args(cmd_parts),
                 cwd=task_folder,
                 stdout=logf,
                 stderr=subprocess.STDOUT,
