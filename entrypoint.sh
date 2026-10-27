@@ -56,42 +56,9 @@ chmod -R 775 "$TASKS_DIR" "$CONFIG_DIR" 2>/dev/null || true  # ADD THIS
 
 
 log "Updating gallery-dl to latest..."
-pip install --no-cache-dir --upgrade gallery-dl
-
-# Workaround for gallery-dl 1.32.x: Instagram now requires the
-# __relay_internal__pv__PolarisProfileRingsGradientEnabledrelayprovider
-# variable in PolarisProfilePageContentQuery, but _user_by_id_impl() sends a
-# hardcoded variable set without it. Every user lookup then fails with
-# "missing_required_variable_value" (a 200 body without 'data'), which
-# gallery-dl reports as "Requested user could not be found".
-# Insert the missing variable into the installed copy until upstream ships
-# the fix. Idempotent: skipped once the flag is present (already patched
-# this boot, or fixed upstream).
-python3 - <<'PYEOF' || log "WARNING: gallery-dl instagram.py patch step failed (non-fatal)"
-import pathlib, re
-try:
-    import gallery_dl
-except ImportError:
-    raise SystemExit(0)
-path = pathlib.Path(gallery_dl.__file__).parent / "extractor" / "instagram.py"
-src = path.read_text()
-flag = "PolarisProfileRingsGradientEnabledrelayprovider"
-if flag in src:
-    raise SystemExit(0)
-pattern = re.compile(
-    r'(_user_by_id_impl\(self, user_id\):.*?)'
-    r'("PolarisShortDramaEnabledrelayprovider":\s*True,)(\n)( +\})',
-    re.S)
-patched, n = pattern.subn(
-    r'\1\2\3            "__relay_internal__pv__"\n'
-    r'            "PolarisProfileRingsGradientEnabledrelayprovider": False,\n\4',
-    src, count=1)
-if n:
-    path.write_text(patched)
-    print("Patched gallery-dl instagram.py (PolarisProfileRingsGradient variable)")
-else:
-    print("WARNING: gallery-dl instagram.py layout changed, patch not applied")
-PYEOF
+# 1.32.18 discovers Instagram's required GraphQL variables and reports API
+# errors directly. Do not patch installed extractor source on each boot.
+pip install --no-cache-dir --upgrade 'gallery-dl>=1.32.18'
 
 log "Updating yt-dlp to latest..."
 pip install --no-cache-dir --upgrade yt-dlp
@@ -103,8 +70,8 @@ else
   log "ffmpeg already present ($(ffmpeg -version 2>&1 | head -1))"
 fi
 
-# remove stale lock files from previous container run
-find /tasks -maxdepth 2 -type f -iname "*lock*" -print -delete || true
+# Remove only Artillery's run lock, not download/archive lock files.
+find "$TASKS_DIR" -mindepth 2 -maxdepth 2 -type f -name lock -print -delete || true
 
 
 # Decide how we run things: as root or as numeric uid:gid
@@ -136,11 +103,11 @@ umask "$UMASK"
 
 
 
-# Tools run as the app user (e.g. gallery-dl) resolve ~ for their caches.
-# Non-root users have no HOME set in this image, so they fall back to an
-# unwritable /.cache. Default HOME to the writable config mount; an explicit
-# HOME from the environment still wins.
-export HOME="${HOME:-$CONFIG_DIR}"
+# Numeric users may inherit HOME=/root or have no passwd home. XDG_CACHE_HOME
+# controls gallery-dl's default cache independently of HOME/gosu's handling.
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$CONFIG_DIR/.cache}"
+mkdir -p "$XDG_CACHE_HOME"
+chown "$PUID:$PGID" "$XDG_CACHE_HOME"
 
 log "Starting web app as $APP_USER_SPEC..."
 # Exec gunicorn as the chosen user so it writes files with correct ownership

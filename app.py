@@ -415,8 +415,8 @@ STREAM_EXTRA_ARGS = shlex.split(os.environ.get("ARTILLERY_STREAM_EXTRA_ARGS", ""
 # gallery-dl.conf, that paces gallery-dl's own hotleak requests and the
 # embedded yt-dlp's video downloads. See _stream_pacing_config().
 STREAM_PACING_CONFIG_FILE = os.path.join(CONFIG_ROOT, "gallery-dl.artillery.conf")
-# Seconds to pause before each hotleak video download (the embedded yt-dlp
-# randomizes between this and 3x). 0 = no per-video pause.
+# Seconds to pause before each hotleak media download, including video
+# extraction (randomized between this and 3x). 0 = no per-media pause.
 STREAM_VIDEO_SLEEP = float(os.environ.get("ARTILLERY_STREAM_VIDEO_SLEEP", "5") or "0")
 
 # Media wall notify file for SSE
@@ -734,25 +734,29 @@ def _stream_pacing_config() -> dict:
 
     * ``extractor.hotleak.*`` — gallery-dl's own requests (creator-page JSON,
       video pages): minimum spacing between requests, retry waits, and
-      exponential 429 backoff (60s, 120s, 240s, ...).
+      exponential 429 backoff (60s, 120s, 240s, ...). The download sleep
+      runs before yt-dlp extraction too, unlike yt-dlp's sleep_interval.
     * ``extractor.hotleak.ytdl.raw-options`` — raw yt-dlp params for the
       yt-dlp instance embedded in gallery-dl's "ytdl" downloader (CLI flags
-      never reach it): pause before each manifest fetch, randomized pause
-      before each video download, native HLS with fragment retries, and
+      never reach it): pause between extraction requests, native HLS with
+      fragment retries, and
       browser-like headers for playlist *and* segment requests.
     """
     return {
         "extractor": {
             "hotleak": {
+                "sleep": f"{STREAM_VIDEO_SLEEP}-{STREAM_VIDEO_SLEEP * 3}",
                 "sleep-request": 1.5,
                 "sleep-retries": "15-45",
                 "sleep-429": "exponential=60",
                 "retries": 8,
                 "ytdl": {
+                    # gallery-dl's outer extraction retry loop has no delay.
+                    # Fail once and continue to later posts (including photos);
+                    # failed videos remain eligible on the next task run.
+                    "retries": 0,
                     "raw-options": {
                         "sleep_interval_requests": STREAM_SLEEP_REQUESTS,
-                        "sleep_interval": STREAM_VIDEO_SLEEP,
-                        "max_sleep_interval": STREAM_VIDEO_SLEEP * 3,
                         "hls_prefer_native": True,
                         "concurrent_fragment_downloads": 1,
                         "fragment_retries": 20,

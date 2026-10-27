@@ -1,6 +1,7 @@
 flask==3.1.1
 flask-wtf==1.2.2
 gunicorn==23.0.0
-gallery-dl
+gallery-dl>=1.32.18
+yt-dlp
 croniter==3.0.3
 apscheduler==3.11.0

@@ -3,3 +3,7 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+*.har
+*.jsonl
+*cookies*.txt
+*logs.txt

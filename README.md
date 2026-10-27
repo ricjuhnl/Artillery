@@ -49,6 +49,31 @@ docker run -d \
 
 gallery-dl updates itself on container start.
 
+### Updating this fork
+
+Run `sh recreate.sh` from the fork checkout on the Docker host after these
+changes have been committed and pushed to your fork. It pulls with
+`--ff-only`, builds `artillery:fork`, then replaces the container using the
+existing config, task and download mounts. It does not deploy unpushed local
+changes from another machine. Stop active downloads before recreating.
+
+The image requires gallery-dl 1.32.18 or newer for updated Instagram GraphQL
+handling; gallery-dl and yt-dlp are also upgraded at startup. The default
+tool cache lives in `/config/.cache` (override with `XDG_CACHE_HOME`). A custom
+`cache.file` setting in `gallery-dl.conf` still takes precedence.
+
+Hotleak downloads sleep before each media extraction/download (5–15 seconds
+by default; `ARTILLERY_STREAM_VIDEO_SLEEP` sets the minimum, 0 disables it).
+Failed yt-dlp extraction is attempted once per video per run rather than
+immediately retried, so later images can still be processed. Failed videos
+are retried on a later run; this does not remove a server-side rate limit.
+
+Local regression checks: install `requirements.txt`, then run
+`python -m unittest discover -s tests -v`. These checks do not contact sites
+or require cookies. Debug logs and browser captures can contain session
+credentials; do not commit them. They are excluded from Docker builds.
+Local browser captures, cookie exports and download logs are also gitignored.
+
 `TZ` (e.g. `Asia/Seoul`, `America/New_York`) controls the timezone used for scheduling and for timestamps shown in the UI (Stats/History, last run, logs). If it's not set, the container defaults to UTC.
 
 ### Docker Compose

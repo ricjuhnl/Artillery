@@ -1,0 +1,13 @@
+.git
+.vscode
+**/__pycache__
+**/*.pyc
+.venv
+venv
+tests
+*.har
+*.jsonl
+*cookies*.txt
+*logs.txt
+.env
+.env.*
